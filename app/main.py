@@ -77,19 +77,22 @@ def default_matrix() -> MatrixOut:
 def validate(
     req: WakeRequest, db: sqlite3.Connection = Depends(get_db)
 ) -> ValidateResponse:
-    """按（计划时刻, 航班号）稳定排序，列出各跑道相邻航班的间隔违规。"""
-    payloads, matrix, violations = run_validate(req)
+    """按（计划时刻, 航班号）稳定排序，列出各跑道相邻航班的间隔违规与关闭窗口命中。"""
+    payloads, closures, matrix, violations, closure_hits = run_validate(req)
     batch_id = save_batch(
         db,
         mode="validate",
         matrix=matrix,
         runway_payloads=payloads,
+        closures_by_runway=closures,
         violations_by_runway=violations,
+        closure_hits_by_runway=closure_hits,
     )
 
     runway_reports: list[RunwayReportOut] = []
     for runway, flights in payloads.items():
         vlist = violations[runway]
+        hlist = closure_hits[runway]
         runway_reports.append(
             RunwayReportOut(
                 runway=runway,
@@ -112,6 +115,19 @@ def validate(
                     }
                     for v in vlist
                 ],
+                closures=[{"start": w.start, "end": w.end} for w in closures[runway]],
+                closure_hit_count=len(hlist),
+                closure_hits=[
+                    {
+                        "flight_no": h.flight_no,
+                        "wake": h.wake,
+                        "scheduled_off": h.scheduled_time,
+                        "position": h.position,
+                        "window_start": h.window_start,
+                        "window_end": h.window_end,
+                    }
+                    for h in hlist
+                ],
             )
         )
 
@@ -121,6 +137,7 @@ def validate(
         total_runways=len(payloads),
         total_flights=sum(len(f) for f in payloads.values()),
         total_violations=sum(len(v) for v in violations.values()),
+        total_closure_hits=sum(len(h) for h in closure_hits.values()),
         runways=runway_reports,
     )
 
@@ -129,13 +146,14 @@ def validate(
 def trial(
     req: WakeRequest, db: sqlite3.Connection = Depends(get_db)
 ) -> TrialResponse:
-    """保持原排序逐项推迟到最早安全时刻；延误向后级联，原计划不变。"""
-    payloads, matrix, trials = run_trial(req)
+    """保持原排序逐项推迟到最早安全时刻；同时避开尾流间隔与关闭窗口，向后级联。"""
+    payloads, closures, matrix, trials = run_trial(req)
     batch_id = save_batch(
         db,
         mode="trial",
         matrix=matrix,
         runway_payloads=payloads,
+        closures_by_runway=closures,
         trial_by_runway=trials,
     )
 
@@ -155,6 +173,7 @@ def trial(
                 delayed_count=len(delayed),
                 total_delay_seconds=rw_delay,
                 max_delay_seconds=max((i.delay_seconds for i in items), default=0),
+                closures=[{"start": w.start, "end": w.end} for w in closures[runway]],
                 items=[
                     {
                         "position": i.position,
@@ -164,6 +183,15 @@ def trial(
                         "adjusted_off": i.adjusted_time,
                         "delay_seconds": i.delay_seconds,
                         "triggered_by": i.triggered_by,
+                        "window_push_count": len(i.window_pushes),
+                        "window_pushes": [
+                            {
+                                "window_start": p.window_start,
+                                "window_end": p.window_end,
+                                "reason": p.reason,
+                            }
+                            for p in i.window_pushes
+                        ],
                     }
                     for i in items
                 ],

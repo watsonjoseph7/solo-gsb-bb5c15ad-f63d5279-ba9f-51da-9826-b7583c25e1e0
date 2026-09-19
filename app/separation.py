@@ -17,7 +17,7 @@ is the flight immediately ahead in the departure order.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -80,6 +80,94 @@ class Violation:
     follower_position: int
 
 
+@dataclass(frozen=True, slots=True)
+class ClosureWindow:
+    """A half-open ``[start, end)`` temporary runway closure (UTC seconds)."""
+
+    start: datetime  # always tz-aware, converted to UTC
+    end: datetime  # always tz-aware, converted to UTC
+
+    @property
+    def start_t(self) -> int:
+        return to_epoch_seconds(self.start)
+
+    @property
+    def end_t(self) -> int:
+        return to_epoch_seconds(self.end)
+
+    def contains(self, t: int) -> bool:
+        """Half-open membership: ``start <= t < end``."""
+        return self.start_t <= t < self.end_t
+
+
+@dataclass(frozen=True, slots=True)
+class ClosureHit:
+    """A flight whose *scheduled* departure time falls inside a closure."""
+
+    flight_no: str
+    wake: str
+    scheduled_time: datetime
+    position: int
+    window_start: datetime
+    window_end: datetime
+
+
+def sort_windows(windows: list[ClosureWindow]) -> list[ClosureWindow]:
+    """Sort closure windows by start time (they must already be non-overlapping)."""
+    return sorted(windows, key=lambda w: (w.start_t, w.end_t))
+
+
+def find_closure_hits(
+    flights: list[Flight], windows: list[ClosureWindow]
+) -> list[ClosureHit]:
+    """List flights whose scheduled time lies within any ``[start, end)`` window.
+
+    Flights are walked in their stable departure order; windows are expected
+    sorted and non-overlapping, so a simple advancing pointer suffices.
+    """
+    ordered = sort_flights(flights)
+    ws = sort_windows(windows)
+    hits: list[ClosureHit] = []
+    wi = 0
+    for position, flight in enumerate(ordered, start=1):
+        while wi < len(ws) and ws[wi].end_t <= flight.t:
+            wi += 1
+        if wi < len(ws) and ws[wi].contains(flight.t):
+            hits.append(
+                ClosureHit(
+                    flight_no=flight.flight_no,
+                    wake=flight.wake,
+                    scheduled_time=flight.scheduled_off,
+                    position=position,
+                    window_start=ws[wi].start,
+                    window_end=ws[wi].end,
+                )
+            )
+    return hits
+
+
+def advance_past_windows(
+    t: int, windows: list[ClosureWindow]
+) -> tuple[int, list[ClosureWindow]]:
+    """Push instant ``t`` forward until it lies outside every closure.
+
+    Each time ``t`` falls in a ``[start, end)`` window it jumps to that
+    window's ``end``; landing inside a *later* window triggers another jump,
+    so window chains are resolved by iteration. Returns the earliest safe
+    instant ``>= t`` and the windows actually traversed (in order).
+    """
+    hit_windows: list[ClosureWindow] = []
+    for w in windows:  # sorted, non-overlapping
+        if w.end_t <= t:
+            continue
+        if t < w.start_t:
+            break
+        # start <= t < end: t is inside this window
+        t = w.end_t
+        hit_windows.append(w)
+    return t, hit_windows
+
+
 @dataclass(slots=True)
 class TrialItem:
     flight_no: str
@@ -89,6 +177,16 @@ class TrialItem:
     delay_seconds: int
     position: int
     triggered_by: str | None  # flight number of the leader that forced the pushback
+    window_pushes: list["WindowPush"] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class WindowPush:
+    """One closure-window jump performed while rescheduling a flight."""
+
+    window_start: datetime
+    window_end: datetime
+    reason: str  # "scheduled" — original time inside the window; "cascade" — pushed in by a delay
 
 
 def build_matrix(
@@ -150,28 +248,59 @@ def find_violations(
 
 
 def trial_reschedule(
-    flights: list[Flight], matrix: dict[tuple[str, str], int]
+    flights: list[Flight],
+    matrix: dict[tuple[str, str], int],
+    windows: list[ClosureWindow] | None = None,
 ) -> list[TrialItem]:
     """Greedily push flights back to the earliest safe time, keeping order.
 
-    The first flight keeps its scheduled time. Every following flight keeps at
-    least the matrix gap behind the (possibly already delayed) flight directly
-    ahead of it, so delays cascade to successors. Original schedules are never
-    rewritten; only :class:`TrialItem` proposals are returned.
+    The first flight keeps its scheduled time unless a closure window covers
+    it. Every following flight keeps at least the matrix gap behind the
+    (possibly already delayed) flight directly ahead of it, so delays cascade
+    to successors. After every push (wake gap *or* closure) the candidate time
+    is re-checked against all closure windows: a push that lands inside a
+    later window jumps again to that window's end, iterating until the time is
+    both gap-safe and outside every ``[start, end)`` closure. Original
+    schedules are never rewritten; only :class:`TrialItem` proposals are
+    returned.
     """
     ordered = sort_flights(flights)
+    ws = sort_windows(windows or [])
     items: list[TrialItem] = []
     prev: Flight | None = None
     prev_adjusted_t = 0
     for position, flight in enumerate(ordered, start=1):
         adjusted_t = flight.t
         triggered_by: str | None = None
+        pushes: list[WindowPush] = []
+
+        # 1) The flight's own scheduled time must be outside every closure.
+        #    Jumps done here (including across several adjacent windows) are
+        #    caused by the schedule, not by the wake cascade.
+        adjusted_t, own_hits = advance_past_windows(adjusted_t, ws)
+        for w in own_hits:
+            pushes.append(WindowPush(window_start=w.start, window_end=w.end, reason="scheduled"))
+
+        # 2) Honour the wake gap behind the (rescheduled) direct leader, then
+        #    re-check closures: a push that lands inside a later window jumps
+        #    to its end (reason "cascade"), iterating until the time is both
+        #    gap-safe and outside every window.
         if prev is not None:
             required = required_gap(matrix, prev.wake, flight.wake)
-            earliest = prev_adjusted_t + required
-            if adjusted_t < earliest:
-                adjusted_t = earliest
-                triggered_by = prev.flight_no
+            while True:
+                earliest = prev_adjusted_t + required
+                if adjusted_t < earliest:
+                    adjusted_t = earliest
+                    triggered_by = prev.flight_no
+                jumped, crossed = advance_past_windows(adjusted_t, ws)
+                if jumped == adjusted_t:
+                    break
+                adjusted_t = jumped
+                for w in crossed:
+                    pushes.append(
+                        WindowPush(window_start=w.start, window_end=w.end, reason="cascade")
+                    )
+
         items.append(
             TrialItem(
                 flight_no=flight.flight_no,
@@ -181,6 +310,7 @@ def trial_reschedule(
                 delay_seconds=adjusted_t - flight.t,
                 position=position,
                 triggered_by=triggered_by,
+                window_pushes=pushes,
             )
         )
         prev = flight

@@ -225,3 +225,188 @@ def test_duplicate_matrix_pair_rejected(client):
     r = client.post("/api/v1/validate", json=body)
     assert r.status_code == 422
     assert "矩阵组合重复" in r.text
+
+
+CLOSURE_BODY = {
+    "runways": [
+        {
+            "runway": "36L",
+            "flights": [
+                _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                _flight("CA2", "2026-09-18T00:01:00Z", "M"),
+                _flight("CA3", "2026-09-18T00:03:00Z", "M"),
+            ],
+            "closures": [
+                {"start": "2026-09-18T00:02:00Z", "end": "2026-09-18T00:03:00Z"},
+                {"start": "2026-09-18T00:03:00Z", "end": "2026-09-18T00:04:00Z"},
+            ],
+        },
+        {
+            "runway": "18R",
+            "flights": [_flight("MU9", "2026-09-18T00:00:00Z", "M")],
+        },
+    ]
+}
+
+
+def test_validate_lists_closure_hits(client):
+    data = client.post("/api/v1/validate", json=CLOSURE_BODY).json()
+    assert data["total_closure_hits"] == 1
+    rw36l = next(rw for rw in data["runways"] if rw["runway"] == "36L")
+    assert len(rw36l["closures"]) == 2
+    assert rw36l["closure_hit_count"] == 1
+    hit = rw36l["closure_hits"][0]
+    assert hit["flight_no"] == "CA3"
+    assert hit["position"] == 3
+    assert hit["window_start"].startswith("2026-09-18T00:03:00")
+    assert hit["window_end"].startswith("2026-09-18T00:04:00")
+    # runway without closures echoes an empty list
+    rw18r = next(rw for rw in data["runways"] if rw["runway"] == "18R")
+    assert rw18r["closures"] == [] and rw18r["closure_hits"] == []
+
+
+def test_validate_closure_half_open_end_not_a_hit(client):
+    # flight exactly at window end is NOT inside [start, end)
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [_flight("CA1", "2026-09-18T00:05:00Z", "M")],
+                "closures": [
+                    {"start": "2026-09-18T00:00:00Z", "end": "2026-09-18T00:05:00Z"}
+                ],
+            }
+        ]
+    }
+    data = client.post("/api/v1/validate", json=body).json()
+    assert data["total_closure_hits"] == 0
+
+
+def test_trial_avoids_closures_and_cascades_iteratively(client):
+    data = client.post("/api/v1/trial", json=CLOSURE_BODY).json()
+    rw36l = next(rw for rw in data["runways"] if rw["runway"] == "36L")
+    items = {i["flight_no"]: i for i in rw36l["items"]}
+
+    # CA2: J->M gap 180 -> 00:03:00 which starts window 2 -> pushed to 00:04:00
+    assert items["CA2"]["adjusted_off"] == "2026-09-18T00:04:00Z"
+    assert items["CA2"]["delay_seconds"] == 180
+    assert items["CA2"]["triggered_by"] == "CA1"
+    push = items["CA2"]["window_pushes"][0]
+    assert push["reason"] == "cascade"
+    assert push["window_start"] == "2026-09-18T00:03:00Z"
+
+    # CA3: own scheduled 00:03 inside window 2 -> 00:04; then 60s behind CA2 -> 00:05
+    assert items["CA3"]["adjusted_off"] == "2026-09-18T00:05:00Z"
+    assert items["CA3"]["triggered_by"] == "CA2"
+    assert items["CA3"]["window_pushes"][0]["reason"] == "scheduled"
+    assert items["CA3"]["window_push_count"] == 1
+
+
+def test_closures_persist_and_roundtrip(client):
+    v = client.post("/api/v1/validate", json=CLOSURE_BODY).json()
+    gv = client.get(f"/api/v1/batches/{v['batch_id']}").json()
+    rw = next(r for r in gv["runways"] if r["runway"] == "36L")
+    assert gv["total_closure_hits"] == 1
+    assert [(c["start"], c["end"]) for c in rw["closures"]] == [
+        ("2026-09-18T00:02:00+00:00", "2026-09-18T00:03:00+00:00"),
+        ("2026-09-18T00:03:00+00:00", "2026-09-18T00:04:00+00:00"),
+    ]
+    assert rw["closure_hits"][0]["flight_no"] == "CA3"
+
+    t = client.post("/api/v1/trial", json=CLOSURE_BODY).json()
+    gt = client.get(f"/api/v1/batches/{t['batch_id']}").json()
+    trw = next(r for r in gt["runways"] if r["runway"] == "36L")
+    gi = {i["flight_no"]: i for i in trw["items"]}
+    assert gi["CA2"]["window_pushes"] == [
+        {
+            "window_start": "2026-09-18T00:03:00+00:00",
+            "window_end": "2026-09-18T00:04:00+00:00",
+            "reason": "cascade",
+        }
+    ]
+    assert len(trw["closures"]) == 2
+
+
+def test_closure_end_not_after_start_rejected(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [_flight("CA1", "2026-09-18T08:00:00Z", "M")],
+                "closures": [
+                    {"start": "2026-09-18T09:00:00Z", "end": "2026-09-18T09:00:00Z"}
+                ],
+            }
+        ]
+    }
+    r = client.post("/api/v1/validate", json=body)
+    assert r.status_code == 422
+    assert "结束必须晚于开始" in r.text
+
+
+def test_overlapping_closures_rejected_touching_allowed(client):
+    overlap = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [_flight("CA1", "2026-09-18T08:00:00Z", "M")],
+                "closures": [
+                    {"start": "2026-09-18T09:00:00Z", "end": "2026-09-18T10:00:00Z"},
+                    {"start": "2026-09-18T09:30:00Z", "end": "2026-09-18T10:30:00Z"},
+                ],
+            }
+        ]
+    }
+    r = client.post("/api/v1/validate", json=overlap)
+    assert r.status_code == 422 and "重叠" in r.text
+
+    touching = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [_flight("CA1", "2026-09-18T08:00:00Z", "M")],
+                "closures": [
+                    {"start": "2026-09-18T09:00:00Z", "end": "2026-09-18T10:00:00Z"},
+                    {"start": "2026-09-18T10:00:00Z", "end": "2026-09-18T11:00:00Z"},
+                ],
+            }
+        ]
+    }
+    assert client.post("/api/v1/validate", json=touching).status_code == 200
+
+
+def test_closure_without_timezone_rejected(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [_flight("CA1", "2026-09-18T08:00:00Z", "M")],
+                "closures": [
+                    {"start": "2026-09-18T09:00:00", "end": "2026-09-18T10:00:00"}
+                ],
+            }
+        ]
+    }
+    r = client.post("/api/v1/validate", json=body)
+    assert r.status_code == 422 and "时区" in r.text
+
+
+def test_closures_accept_other_timezones(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T17:00:00+08:00", "M"),
+                ],
+                "closures": [
+                    {"start": "2026-09-18T16:30:00+08:00", "end": "2026-09-18T17:30:00+08:00"}
+                ],
+            }
+        ]
+    }
+    data = client.post("/api/v1/validate", json=body).json()
+    hit = data["runways"][0]["closure_hits"][0]
+    # normalised to UTC: 09:00Z flight inside 08:30Z-09:30Z window
+    assert hit["scheduled_off"] == "2026-09-18T09:00:00Z"
+    assert hit["window_start"] == "2026-09-18T08:30:00Z"

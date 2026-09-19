@@ -63,6 +63,52 @@ CREATE INDEX IF NOT EXISTS idx_violations_batch ON violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_batch ON trial_items(batch_id);
 """
 
+# Additive schema pieces, kept separate from SCHEMA so databases created by an
+# earlier release (persisted in the Docker volume) pick up the new tables on
+# startup. Every statement is idempotent ("IF NOT EXISTS").
+MIGRATIONS = [
+    """
+    CREATE TABLE IF NOT EXISTS closures (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id    TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+        runway      TEXT NOT NULL,
+        position    INTEGER NOT NULL,
+        start_time  TEXT NOT NULL,
+        end_time    TEXT NOT NULL,
+        UNIQUE(batch_id, runway, position)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS closure_hits (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id      TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+        runway        TEXT NOT NULL,
+        flight_no     TEXT NOT NULL,
+        wake          TEXT NOT NULL,
+        flight_time   TEXT NOT NULL,
+        flight_position INTEGER NOT NULL,
+        window_start  TEXT NOT NULL,
+        window_end    TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS trial_window_pushes (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id      TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+        runway        TEXT NOT NULL,
+        flight_no     TEXT NOT NULL,
+        flight_position INTEGER NOT NULL,
+        push_order    INTEGER NOT NULL,
+        window_start  TEXT NOT NULL,
+        window_end    TEXT NOT NULL,
+        reason        TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_closures_batch ON closures(batch_id)",
+    "CREATE INDEX IF NOT EXISTS idx_closure_hits_batch ON closure_hits(batch_id)",
+    "CREATE INDEX IF NOT EXISTS idx_trial_pushes_batch ON trial_window_pushes(batch_id)",
+]
+
 
 def _connect(db_path: str) -> sqlite3.Connection:
     directory = os.path.dirname(db_path)
@@ -79,6 +125,8 @@ def init_db(db_path: str | None = None) -> None:
     path = db_path or settings.db_path
     with _connect(path) as conn:
         conn.executescript(SCHEMA)
+        for statement in MIGRATIONS:
+            conn.execute(statement)
 
 
 @contextmanager

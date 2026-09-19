@@ -8,8 +8,10 @@ import pytest
 
 from app.separation import (
     DEFAULT_MATRIX,
+    ClosureWindow,
     Flight,
     build_matrix,
+    find_closure_hits,
     find_violations,
     required_gap,
     sort_flights,
@@ -25,6 +27,10 @@ def dt(seconds: int) -> datetime:
 
 def make(no: str, t: int, wake: str) -> Flight:
     return Flight(flight_no=no, scheduled_off=dt(t), wake=wake)
+
+
+def win(start: int, end: int) -> ClosureWindow:
+    return ClosureWindow(start=dt(start), end=dt(end))
 
 
 def test_stable_sort_by_time_then_flight_no():
@@ -116,3 +122,98 @@ def test_single_flight_has_no_violation_and_no_delay():
     assert find_violations(flights, build_matrix(None)) == []
     (item,) = trial_reschedule(flights, build_matrix(None))
     assert item.delay_seconds == 0 and item.triggered_by is None
+
+
+# ---------- closure windows ----------
+
+
+def test_half_open_window_boundary():
+    w = win(100, 200)
+    assert w.contains(100) is True   # start inclusive
+    assert w.contains(199) is True
+    assert w.contains(200) is False  # end exclusive
+
+
+def test_find_closure_hits_matches_scheduled_times():
+    flights = [make("A", 50, "M"), make("B", 100, "M"), make("C", 200, "M")]
+    hits = find_closure_hits(flights, [win(100, 200)])
+    assert [h.flight_no for h in hits] == ["B"]
+    hit = hits[0]
+    assert hit.position == 2
+    assert hit.window_start == dt(100) and hit.window_end == dt(200)
+    # exactly on the end is not a hit
+    assert find_closure_hits([make("D", 200, "M")], [win(100, 200)]) == []
+
+
+def test_trial_pushes_scheduled_closure_first_flight():
+    items = trial_reschedule([make("SOLO", 50, "M")], build_matrix(None), [win(0, 100)])
+    item = items[0]
+    assert item.adjusted_time == dt(100)
+    assert item.delay_seconds == 50
+    assert item.triggered_by is None
+    assert item.window_pushes[0].reason == "scheduled"
+
+
+def test_trial_wake_push_into_window_is_cascade():
+    # J->M requires 180s: F2 pushed 60 -> 180 which opens [180, 240)
+    flights = [make("F1", 0, "J"), make("F2", 60, "M")]
+    items = trial_reschedule(flights, build_matrix(None), [win(180, 240)])
+    item = items[1]
+    assert item.adjusted_time == dt(240)
+    assert item.delay_seconds == 180
+    assert item.triggered_by == "F1"
+    assert [p.reason for p in item.window_pushes] == ["cascade"]
+
+
+def test_trial_iterates_across_adjacent_windows():
+    # own time 60 in [60,120) -> 120 at start of [120,180) -> 180
+    flights = [make("A", 0, "M"), make("B", 60, "M")]
+    items = trial_reschedule(flights, build_matrix(None), [win(60, 120), win(120, 180)])
+    item = items[1]
+    assert item.adjusted_time == dt(180)
+    assert [p.reason for p in item.window_pushes] == ["scheduled", "scheduled"]
+
+
+def test_trial_wake_cascade_across_two_later_windows():
+    # own time 90 is clean; gap behind A@50 needs 110 -> in [100,150) -> 150 in [150,200) -> 200
+    flights = [make("A", 50, "M"), make("B", 90, "M")]
+    items = trial_reschedule(flights, build_matrix(None), [win(100, 150), win(150, 200)])
+    item = items[1]
+    assert item.adjusted_time == dt(200)
+    assert item.delay_seconds == 110
+    assert item.triggered_by == "A"
+    assert [p.reason for p in item.window_pushes] == ["cascade", "cascade"]
+
+
+def test_trial_scheduled_hit_then_wake_push_into_later_window():
+    # F2 scheduled 100 in [100,160) -> 160; J->M gap needs 180 -> in [180,260) -> 260
+    flights = [make("F1", 0, "J"), make("F2", 100, "M")]
+    items = trial_reschedule(flights, build_matrix(None), [win(100, 160), win(180, 260)])
+    item = items[1]
+    assert item.adjusted_time == dt(260)
+    assert item.delay_seconds == 160
+    assert item.triggered_by == "F1"
+    assert [p.reason for p in item.window_pushes] == ["scheduled", "cascade"]
+
+
+def test_trial_closure_cascades_to_successors():
+    # J@0 -> M needs 180; F2@100 in [100,300) -> 300;
+    # F3@350 needs 60 behind F2@300 -> pushed to 360 (cascade, no window involved)
+    flights = [make("F1", 0, "J"), make("F2", 100, "M"), make("F3", 350, "M")]
+    items = trial_reschedule(flights, build_matrix(None), [win(100, 300)])
+    assert items[1].adjusted_time == dt(300)
+    assert items[2].adjusted_time == dt(360)
+    assert items[2].triggered_by == "F2"
+    assert items[2].window_pushes == []
+
+
+def test_trial_departure_exactly_at_window_end_allowed():
+    items = trial_reschedule([make("SOLO", 100, "M")], build_matrix(None), [win(0, 100)])
+    assert items[0].delay_seconds == 0 and items[0].window_pushes == []
+
+
+def test_trial_without_windows_unchanged_behaviour():
+    flights = [make("CA1", 0, "J"), make("CA2", 60, "M")]
+    items = trial_reschedule(flights, build_matrix(None))
+    assert items[1].adjusted_time == dt(180)
+    assert items[1].window_pushes == []

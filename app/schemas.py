@@ -34,11 +34,34 @@ class FlightIn(BaseModel):
         return v
 
 
+class ClosureWindowIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: datetime = Field(
+        ..., description="关闭开始时刻（含），ISO 8601，必须带时区"
+    )
+    end: datetime = Field(
+        ..., description="关闭结束时刻（不含），ISO 8601，必须带时区；半开区间 [start, end)"
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _require_timezone(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("关闭窗口时刻必须携带时区信息（ISO 8601 offset 或 Z）")
+        return v
+
+
 class RunwayIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     runway: str = Field(..., min_length=1, examples=["36L"])
     flights: list[FlightIn] = Field(..., min_length=1)
+    closures: list[ClosureWindowIn] = Field(
+        default_factory=list,
+        description="该跑道的临时关闭窗口（半开区间 [start, end)，可多个）；"
+        "结束必须晚于开始，窗口之间不得重叠（端点相接允许）。",
+    )
 
     @field_validator("runway")
     @classmethod
@@ -56,7 +79,24 @@ class RunwayIn(BaseModel):
             if key in seen:
                 raise ValueError(f"跑道 {self.runway} 内航班号重复: {key}")
             seen.add(key)
+        self._validate_closures()
         return self
+
+    def _validate_closures(self) -> None:
+        ordered = sorted(self.closures, key=lambda w: (w.start, w.end))
+        prev_end: datetime | None = None
+        for w in ordered:
+            if w.end <= w.start:
+                raise ValueError(
+                    f"跑道 {self.runway} 关闭窗口结束必须晚于开始: "
+                    f"[{w.start.isoformat()}, {w.end.isoformat()})"
+                )
+            if prev_end is not None and w.start < prev_end:
+                raise ValueError(
+                    f"跑道 {self.runway} 关闭窗口彼此重叠: "
+                    f"前一窗口结束 {prev_end.isoformat()} 晚于后一窗口开始 {w.start.isoformat()}"
+                )
+            prev_end = w.end
 
 
 class MatrixEntryIn(BaseModel):
@@ -104,6 +144,26 @@ class WakeRequest(BaseModel):
 # ---------- response models ----------
 
 
+class ClosureWindowOut(BaseModel):
+    start: datetime
+    end: datetime
+
+
+class ClosureHitOut(BaseModel):
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+    position: int
+    window_start: datetime
+    window_end: datetime
+
+
+class WindowPushOut(BaseModel):
+    window_start: datetime
+    window_end: datetime
+    reason: str
+
+
 class ViolationOut(BaseModel):
     leader: str
     follower: str
@@ -124,6 +184,9 @@ class RunwayReportOut(BaseModel):
     total: int
     violation_count: int
     violations: list[ViolationOut]
+    closures: list[ClosureWindowOut] = Field(default_factory=list)
+    closure_hit_count: int = 0
+    closure_hits: list[ClosureHitOut] = Field(default_factory=list)
 
 
 class ValidateResponse(BaseModel):
@@ -133,6 +196,7 @@ class ValidateResponse(BaseModel):
     total_runways: int
     total_flights: int
     total_violations: int
+    total_closure_hits: int = 0
     runways: list[RunwayReportOut]
 
 
@@ -144,6 +208,8 @@ class TrialItemOut(BaseModel):
     adjusted_off: datetime
     delay_seconds: int
     triggered_by: str | None
+    window_push_count: int = 0
+    window_pushes: list[WindowPushOut] = Field(default_factory=list)
 
 
 class RunwayTrialOut(BaseModel):
@@ -153,6 +219,7 @@ class RunwayTrialOut(BaseModel):
     delayed_count: int
     total_delay_seconds: int
     max_delay_seconds: int
+    closures: list[ClosureWindowOut] = Field(default_factory=list)
     items: list[TrialItemOut]
 
 
@@ -185,6 +252,7 @@ class BatchResponse(BaseModel):
     total_runways: int
     total_flights: int
     total_violations: int | None = None
+    total_closure_hits: int | None = None
     total_delayed: int | None = None
     total_delay_seconds: int | None = None
     runways: list[dict]
