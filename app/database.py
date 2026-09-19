@@ -55,13 +55,57 @@ CREATE TABLE IF NOT EXISTS trial_items (
     scheduled_off  TEXT NOT NULL,
     adjusted_off   TEXT NOT NULL,
     delay_seconds  INTEGER NOT NULL,
-    triggered_by   TEXT
+    triggered_by   TEXT,
+    closure_hit    INTEGER NOT NULL DEFAULT 0,
+    closure_window_start TEXT,
+    closure_window_end   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS closures (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+    runway       TEXT NOT NULL,
+    window_index INTEGER NOT NULL,
+    start_utc    TEXT NOT NULL,
+    end_utc      TEXT NOT NULL,
+    UNIQUE(batch_id, runway, window_index)
+);
+
+CREATE TABLE IF NOT EXISTS closure_conflicts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id      TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+    runway        TEXT NOT NULL,
+    position      INTEGER NOT NULL,
+    flight_no     TEXT NOT NULL,
+    wake          TEXT NOT NULL,
+    scheduled_off TEXT NOT NULL,
+    window_index  INTEGER NOT NULL,
+    window_start  TEXT NOT NULL,
+    window_end    TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_flights_batch ON flights(batch_id);
 CREATE INDEX IF NOT EXISTS idx_violations_batch ON violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_batch ON trial_items(batch_id);
+CREATE INDEX IF NOT EXISTS idx_closures_batch ON closures(batch_id);
+CREATE INDEX IF NOT EXISTS idx_closure_conflicts_batch ON closure_conflicts(batch_id);
 """
+
+# Columns added after the initial release: existing database files (e.g. the
+# Docker volume) are migrated in place, since CREATE TABLE IF NOT EXISTS never
+# alters an already-present table.
+_TRIAL_ITEM_COLUMNS = {
+    "closure_hit": "INTEGER NOT NULL DEFAULT 0",
+    "closure_window_start": "TEXT",
+    "closure_window_end": "TEXT",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(trial_items)")}
+    for name, ddl in _TRIAL_ITEM_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE trial_items ADD COLUMN {name} {ddl}")
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -79,6 +123,7 @@ def init_db(db_path: str | None = None) -> None:
     path = db_path or settings.db_path
     with _connect(path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 @contextmanager

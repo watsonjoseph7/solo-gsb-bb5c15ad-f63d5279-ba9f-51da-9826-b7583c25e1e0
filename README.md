@@ -1,13 +1,16 @@
 # 跑道离场尾流间隔校验 API
 
 基于 **Python + FastAPI + SQLite** 的跑道离场尾流（wake turbulence）间隔校验服务。
-客户端按跑道提交航班计划与前机—后机最小间隔矩阵，服务端完成两件事：
+客户端按跑道提交航班计划与前机—后机最小间隔矩阵，并可为每条跑道配置**临时关闭窗口**，
+服务端完成两件事：
 
-1. **间隔校验（validate）**：按计划离场时刻、航班号稳定排序，列出同跑道相邻航班的间隔违规。
-2. **试排（trial）**：保持原航班顺序，逐项把航班推迟到满足间隔的最早安全时刻；
-   延误沿队列向后级联，**原计划时刻绝不改写**。返回调整后时刻、单项延误与触发前机。
+1. **间隔校验（validate）**：按计划离场时刻、航班号稳定排序，列出同跑道相邻航班的间隔违规，
+   以及计划离场时刻落入关闭窗口的航班及其命中窗口。
+2. **试排（trial）**：保持原航班顺序，逐项把航班推迟到**同时满足尾流间隔且避开关闭窗口**的
+   最早安全时刻；延误沿队列向后级联，**原计划时刻绝不改写**。
+   返回调整后时刻、单项延误、触发前机与关闭窗口命中情况。
 
-每次请求（含输入排序结果、违规/试排结论）都会持久化到 SQLite，可用批次 ID 回查。
+每次请求（含输入排序结果、关闭窗口、违规/冲突/试排结论）都会持久化到 SQLite，可用批次 ID 回查。
 
 ---
 
@@ -53,6 +56,9 @@ docker compose up -d --build
         {"flight_no": "CA101", "scheduled_off": "2026-09-18T08:00:00+08:00", "wake": "J"},
         {"flight_no": "CA102", "scheduled_off": "2026-09-18T08:01:00+08:00", "wake": "M"},
         {"flight_no": "CA103", "scheduled_off": "2026-09-18T08:02:30+08:00", "wake": "M"}
+      ],
+      "closures": [
+        {"start": "2026-09-18T08:02:30+08:00", "end": "2026-09-18T08:03:30+08:00"}
       ]
     }
   ]
@@ -66,20 +72,41 @@ docker compose up -d --build
 - 仅检查排序后**相邻**两架航班（单跑道离场的运行惯例）：前机尾流等级 → 后机尾流等级查矩阵，
   实际间隔 < 要求间隔即违规，返回要求秒数、实际秒数与缺口秒数。
 
+#### 跑道临时关闭窗口（可选字段 `closures`）
+
+每条跑道可携带多个关闭窗口，语义为 **`[start, end)` 左闭右开**：
+
+- `start` / `end` 均为 ISO 8601 且**必须带时区**，服务端统一归一化为 UTC；
+- `end` 必须**晚于** `start`（相等或倒置都会被拒绝，`422`）；
+- 同一跑道内窗口**不得重叠**（`422`）；首尾相接（前一个的 `end` 等于后一个的 `start`）是允许的；
+- 响应中 `closures` 按开始时刻升序、以 UTC 原样回显。
+
+validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口内（含 `start`、不含 `end`）的航班，
+在对应跑道的 `closure_conflicts` 中列出，含 `flight_no`、`position`（排序后位次）、
+`window_index`（命中窗口在回显 `closures` 中的 1 基序号）与窗口起止时刻；
+跑道级与批次级分别汇总 `closure_conflict_count` / `total_closure_conflicts`。
+
 ### `POST /api/v1/trial` — 试排（级联推迟）
 
-请求体与 validate 完全一致。算法：
+请求体与 validate 完全一致（含 `closures`）。算法：
 
-- 顺序保持为稳定排序结果，首架航班不动；
-- 自第二架起，若与**已调整后的直接前机**间隔不足，则把本架推迟到 `前机调整时刻 + 要求间隔`；
-- 因此延误自动向后续航班级联；航班不会被提前；
+- 顺序保持为稳定排序结果；航班**只会推迟、绝不提前**；
+- 每架航班取满足以下全部条件的最早时刻：
+  1. 不早于其原计划时刻；
+  2. 不早于 `直接前机调整时刻 + 要求间隔`（首架航班无前机约束）；
+  3. 不落在任何关闭窗口内 —— 若落入窗口则推迟到该窗口 `end`；窗口首尾相接时会**继续迭代**，
+     直到完全离开关闭时段（尾流推迟后落入后续窗口的情形同样处理）；
+- 因此延误自动向后续航班级联；
 - 每项返回 `adjusted_off`（调整后时刻，UTC）、`delay_seconds`（单项延误，非负）、
-  `triggered_by`（触发本次推迟的直接前机航班号；未延误为 `null`）。
+  `triggered_by`（触发本次推迟的直接前机航班号；未因尾流推迟为 `null`）、
+  `closure_hit`（是否因关闭窗口产生了额外推迟）与
+  `closure_window`（最后命中并导致推迟的窗口，未命中为 `null`）；
 - 该接口只返回试排建议，`scheduled_off` 原值原样返回，数据库中也同时保存原计划。
 
 ### `GET /api/v1/batches/{batch_id}` — 批次回查
 
-两个 POST 接口的返回都带 `batch_id`，可随时回查当时的输入顺序、生效矩阵与结论（validate/trial 均可）。
+两个 POST 接口的返回都带 `batch_id`，可随时回查当时的输入顺序、生效矩阵、关闭窗口与结论
+（validate 的违规与关闭冲突 / trial 的试排结果），字段与 POST 响应一致。
 不存在的 ID 返回 `404`。
 
 ### 间隔矩阵（可选字段 `matrix`）
@@ -109,7 +136,8 @@ docker compose up -d --build
 
 ### 错误约定
 
-- `422`：请求体不合法（缺时区、航班号/跑道重复、尾流等级非法、矩阵条目非法等），响应体含中文原因。
+- `422`：请求体不合法（缺时区、航班号/跑道重复、尾流等级非法、矩阵条目非法、
+  关闭窗口结束不晚于开始或彼此重叠等），响应体含中文原因。
 - `404`：批次 ID 不存在。
 
 ---
@@ -131,7 +159,7 @@ curl -s -X POST http://localhost:8000/api/v1/trial \
 curl -s http://localhost:8000/api/v1/batches/<batch_id>
 ```
 
-`sample.json` 已随仓库提供，可直接使用。
+`sample.json` 已随仓库提供（含两条跑道的关闭窗口示例），可直接使用。
 
 ---
 
@@ -145,7 +173,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 21 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 39 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -157,16 +185,16 @@ python3 -m pytest -q
 ```
 app/
   main.py         # FastAPI 路由（validate / trial / batches / 元信息）
-  schemas.py      # Pydantic 请求与响应模型、输入校验
+  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口合法性）
   service.py      # 请求 -> 领域对象 -> 模式计算
-  separation.py   # 核心领域逻辑：稳定排序、相邻违规、级联试排、默认矩阵
+  separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、避窗级联试排、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
-  database.py     # SQLite 连接与建表
-  repository.py   # 批次/航班/违规/试排结果的持久化与回查
+  database.py     # SQLite 连接、建表与旧库迁移
+  repository.py   # 批次/航班/关闭窗口/冲突/违规/试排结果的持久化与回查
   config.py       # 环境变量配置
 tests/            # pytest 领域单测 + TestClient API 测试
 Dockerfile
 docker-compose.yml
-sample.json
+sample.json       # 含关闭窗口的示例请求
 requirements.txt
 ```

@@ -66,6 +66,38 @@ class Flight:
 
 
 @dataclass(frozen=True, slots=True)
+class ClosureWindow:
+    """A temporary runway closure ``[start, end)`` after UTC normalisation."""
+
+    start: datetime  # always tz-aware, converted to UTC
+    end: datetime  # always tz-aware, converted to UTC
+
+    @property
+    def s(self) -> int:
+        return to_epoch_seconds(self.start)
+
+    @property
+    def e(self) -> int:
+        return to_epoch_seconds(self.end)
+
+    def contains(self, t: int) -> bool:
+        return self.s <= t < self.e
+
+
+@dataclass(frozen=True, slots=True)
+class ClosureConflict:
+    """A flight whose scheduled off-time falls inside a closure window."""
+
+    flight_no: str
+    wake: str
+    scheduled_off: datetime
+    position: int
+    window_index: int  # 1-based index into the runway's sorted closure list
+    window_start: datetime
+    window_end: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class Violation:
     leader_no: str
     follower_no: str
@@ -89,6 +121,8 @@ class TrialItem:
     delay_seconds: int
     position: int
     triggered_by: str | None  # flight number of the leader that forced the pushback
+    closure_hit: bool  # a closure window forced (further) delay
+    closure_window: ClosureWindow | None  # the last window that pushed this flight
 
 
 def build_matrix(
@@ -118,6 +152,41 @@ def required_gap(
 def sort_flights(flights: list[Flight]) -> list[Flight]:
     """Stable sort by (scheduled time, flight number)."""
     return sorted(flights, key=Flight.sort_key)
+
+
+def sort_windows(windows: list[ClosureWindow]) -> list[ClosureWindow]:
+    """Sort closure windows by (start, end); input is already non-overlapping."""
+    return sorted(windows, key=lambda w: (w.s, w.e))
+
+
+def find_closure_conflicts(
+    flights: list[Flight], windows: list[ClosureWindow]
+) -> list[ClosureConflict]:
+    """List flights whose scheduled off-time falls inside a closure window.
+
+    Windows are half-open ``[start, end)`` and non-overlapping, so a flight
+    hits at most one window. ``window_index`` is 1-based over the sorted
+    window list, matching the closures echoed back in the API responses.
+    """
+    ordered = sort_flights(flights)
+    wins = sort_windows(windows)
+    conflicts: list[ClosureConflict] = []
+    for position, flight in enumerate(ordered, start=1):
+        for index, window in enumerate(wins, start=1):
+            if window.contains(flight.t):
+                conflicts.append(
+                    ClosureConflict(
+                        flight_no=flight.flight_no,
+                        wake=flight.wake,
+                        scheduled_off=flight.scheduled_off,
+                        position=position,
+                        window_index=index,
+                        window_start=window.start,
+                        window_end=window.end,
+                    )
+                )
+                break
+    return conflicts
 
 
 def find_violations(
@@ -150,16 +219,23 @@ def find_violations(
 
 
 def trial_reschedule(
-    flights: list[Flight], matrix: dict[tuple[str, str], int]
+    flights: list[Flight],
+    matrix: dict[tuple[str, str], int],
+    windows: list[ClosureWindow] | None = None,
 ) -> list[TrialItem]:
     """Greedily push flights back to the earliest safe time, keeping order.
 
-    The first flight keeps its scheduled time. Every following flight keeps at
-    least the matrix gap behind the (possibly already delayed) flight directly
-    ahead of it, so delays cascade to successors. Original schedules are never
-    rewritten; only :class:`TrialItem` proposals are returned.
+    Every flight is placed at the earliest instant that (a) is not earlier
+    than its scheduled time, (b) keeps at least the matrix gap behind the
+    (possibly already delayed) flight directly ahead of it, and (c) avoids
+    every closure window. If the wake-separation push lands the flight inside
+    a closure window, it is pushed further to that window's end — iterating
+    because a window end may coincide with the next window's start. Delays
+    cascade to successors. Original schedules are never rewritten; only
+    :class:`TrialItem` proposals are returned.
     """
     ordered = sort_flights(flights)
+    wins = sort_windows(windows or [])
     items: list[TrialItem] = []
     prev: Flight | None = None
     prev_adjusted_t = 0
@@ -172,6 +248,15 @@ def trial_reschedule(
             if adjusted_t < earliest:
                 adjusted_t = earliest
                 triggered_by = prev.flight_no
+        closure_hit = False
+        closure_window: ClosureWindow | None = None
+        for window in wins:
+            if adjusted_t < window.s:
+                break  # in a gap before this (and every later) window
+            if window.contains(adjusted_t):
+                adjusted_t = window.e
+                closure_hit = True
+                closure_window = window
         items.append(
             TrialItem(
                 flight_no=flight.flight_no,
@@ -181,6 +266,8 @@ def trial_reschedule(
                 delay_seconds=adjusted_t - flight.t,
                 position=position,
                 triggered_by=triggered_by,
+                closure_hit=closure_hit,
+                closure_window=closure_window,
             )
         )
         prev = flight

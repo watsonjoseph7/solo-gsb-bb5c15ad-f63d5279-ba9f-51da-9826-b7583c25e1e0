@@ -21,6 +21,7 @@ from .schemas import (
     WakeRequest,
     default_matrix_nested,
 )
+from .separation import ClosureWindow
 from .service import nested_matrix, run_trial, run_validate
 from .config import settings
 
@@ -34,10 +35,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="跑道离场尾流间隔校验 API",
     description=(
-        "提交按跑道分组的航班计划，校验相邻离场航班的尾流间隔违规，"
-        "并支持在不改动原计划的前提下试排（向后级联延误）。"
+        "提交按跑道分组的航班计划（可附带跑道临时关闭窗口），校验相邻离场航班的"
+        "尾流间隔违规与落入关闭窗口的航班，并支持在不改动原计划的前提下试排"
+        "（向后级联延误，自动避开关闭窗口）。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -73,28 +75,37 @@ def default_matrix() -> MatrixOut:
     return MatrixOut(matrix=default_matrix_nested())
 
 
+def _window_out(window: ClosureWindow) -> dict:
+    return {"start": window.start, "end": window.end}
+
+
 @app.post("/api/v1/validate", response_model=ValidateResponse, tags=["wake"])
 def validate(
     req: WakeRequest, db: sqlite3.Connection = Depends(get_db)
 ) -> ValidateResponse:
-    """按（计划时刻, 航班号）稳定排序，列出各跑道相邻航班的间隔违规。"""
-    payloads, matrix, violations = run_validate(req)
+    """按（计划时刻, 航班号）稳定排序，列出各跑道相邻航班的间隔违规，
+    以及计划离场时刻落入关闭窗口的航班及其命中窗口。"""
+    payloads, matrix, windows, violations, conflicts = run_validate(req)
     batch_id = save_batch(
         db,
         mode="validate",
         matrix=matrix,
         runway_payloads=payloads,
+        closures_by_runway=windows,
         violations_by_runway=violations,
+        closure_conflicts_by_runway=conflicts,
     )
 
     runway_reports: list[RunwayReportOut] = []
     for runway, flights in payloads.items():
         vlist = violations[runway]
+        clist = conflicts[runway]
         runway_reports.append(
             RunwayReportOut(
                 runway=runway,
                 order=[f.flight_no for f in flights],
                 total=len(flights),
+                closures=[_window_out(w) for w in windows[runway]],
                 violation_count=len(vlist),
                 violations=[
                     {
@@ -112,6 +123,19 @@ def validate(
                     }
                     for v in vlist
                 ],
+                closure_conflict_count=len(clist),
+                closure_conflicts=[
+                    {
+                        "flight_no": c.flight_no,
+                        "wake": c.wake,
+                        "scheduled_off": c.scheduled_off,
+                        "position": c.position,
+                        "window_index": c.window_index,
+                        "window_start": c.window_start,
+                        "window_end": c.window_end,
+                    }
+                    for c in clist
+                ],
             )
         )
 
@@ -121,6 +145,7 @@ def validate(
         total_runways=len(payloads),
         total_flights=sum(len(f) for f in payloads.values()),
         total_violations=sum(len(v) for v in violations.values()),
+        total_closure_conflicts=sum(len(c) for c in conflicts.values()),
         runways=runway_reports,
     )
 
@@ -129,13 +154,15 @@ def validate(
 def trial(
     req: WakeRequest, db: sqlite3.Connection = Depends(get_db)
 ) -> TrialResponse:
-    """保持原排序逐项推迟到最早安全时刻；延误向后级联，原计划不变。"""
-    payloads, matrix, trials = run_trial(req)
+    """保持原排序逐项推迟到最早安全时刻（满足尾流间隔且避开关闭窗口）；
+    延误向后级联，原计划不变。"""
+    payloads, matrix, windows, trials = run_trial(req)
     batch_id = save_batch(
         db,
         mode="trial",
         matrix=matrix,
         runway_payloads=payloads,
+        closures_by_runway=windows,
         trial_by_runway=trials,
     )
 
@@ -152,6 +179,7 @@ def trial(
                 runway=runway,
                 order=[i.flight_no for i in items],
                 total=len(items),
+                closures=[_window_out(w) for w in windows[runway]],
                 delayed_count=len(delayed),
                 total_delay_seconds=rw_delay,
                 max_delay_seconds=max((i.delay_seconds for i in items), default=0),
@@ -164,6 +192,10 @@ def trial(
                         "adjusted_off": i.adjusted_time,
                         "delay_seconds": i.delay_seconds,
                         "triggered_by": i.triggered_by,
+                        "closure_hit": i.closure_hit,
+                        "closure_window": (
+                            _window_out(i.closure_window) if i.closure_window else None
+                        ),
                     }
                     for i in items
                 ],
